@@ -1,9 +1,110 @@
-name: drone-test
-kind: pipeline
-type: docker
+# ==============================================================================
+# Pull request clone ===========================================================
+# ==============================================================================
+# Use plugin to checkout pull requests for caching issue:
+# https://github.com/drone/drone/issues/2390
+# ==============================================================================
+clone:
+  git:
+    image: registry.fpfis.eu/drone-plugins/git:next
+    when:
+      event: [ push, pull_request, tag ]
+  git:
+    image: registry.fpfis.eu/drone-plugins/git
+    when:
+      event: [ deployment ]
 
-steps:
-- name: test
-  image: alpine
-  commands:
-  - echo "It worked!"
+workspace:
+  base: /test
+  path: pipelines
+
+matrix:
+  PHP_VERSION:
+    - 7.3
+
+pipeline:
+  # ============================================================================
+  # Tests ======================================================================
+  # ============================================================================
+  composer:
+    image: registry.fpfis.eu/fpfis/httpd-php:${PHP_VERSION=7.3}-ci
+    commands:
+      - composer install
+    when:
+      event: [ push, pull_request, tag ]
+    volumes:
+      - /cache/${DRONE_REPO_NAME}:/cache
+
+  grumphp:
+    image: registry.fpfis.eu/fpfis/httpd-php:${PHP_VERSION=7.3}-ci
+    secrets: [ github_api_token, qa_api_basic_auth ]
+    commands:
+      - ./vendor/bin/grumphp run
+    when:
+      event: [ push, pull_request, tag ]
+
+  # ============================================================================
+  # Deploy events ==============================================================
+  # ============================================================================
+
+  # Run composer install --no-dev to only deploy needed packages
+  composer-no-dev:
+    image: registry.fpfis.eu/fpfis/httpd-php:${PHP_VERSION=7.3}-ci
+    commands:
+      - composer install --no-dev
+    when:
+      event: [ deployment ]
+    volumes:
+      - /cache/${DRONE_REPO_NAME}:/cache
+
+  # Trigger deploy event for acceptance
+  create-deploy-acceptance:
+    image: registry.fpfis.eu/drone-plugins/github-deploy
+    state: create
+    deploy_environment: acceptance
+    secrets: [ github_api_token ]
+    automerge: false
+    when:
+      event: push
+      branch: [ release/* ]
+
+  # Trigger deploy event for playground
+  create-deploy-production:
+    image: registry.fpfis.eu/drone-plugins/github-deploy
+    state: create
+    deploy_environment: production
+    secrets: [ github_api_token ]
+    automerge: false
+    when:
+      event: tag
+      branch: [ master ]
+
+  # ============================================================================
+  # Deployment =================================================================
+  # ============================================================================
+
+  deploy-set-version:
+    image: registry.fpfis.eu/fpfis/httpd-php:${PHP_VERSION=7.3}-ci
+    commands:
+      - echo ${DRONE_TAG=${DRONE_COMMIT_BRANCH=rc}} > .version
+      - echo ${DRONE_COMMIT_SHA} > .commit
+    when:
+      event: deployment
+      environment: [ acceptance , production ]
+
+  deploy:
+    image: registry.fpfis.eu/drone-plugins/rsync:latest
+    secrets:
+      - source: DEPLOY_KEY_${DRONE_DEPLOY_TO}
+        target: PLUGIN_KEY
+      - source: DEPLOY_SRV_${DRONE_DEPLOY_TO}
+        target: PLUGIN_HOSTS
+    user: apache
+    source: ./
+    target: /var/www/html/
+    exclude: [ ".git", ".env" ]
+    delete: true
+    recursive: true
+    when:
+      event: deployment
+      environment: [ acceptance , production ]
